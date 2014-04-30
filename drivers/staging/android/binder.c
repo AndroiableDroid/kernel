@@ -2583,7 +2583,6 @@ static int binder_thread_write(struct binder_proc *proc,
 			binder_uintptr_t cookie;
 			struct binder_ref_death *death = NULL;
 
-
 			if (get_user(cookie, (binder_uintptr_t __user *)ptr))
 				return -EFAULT;
 

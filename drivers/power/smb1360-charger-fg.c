@@ -31,6 +31,11 @@
 #include <linux/completion.h>
 #include <linux/pm_wakeup.h>
 
+#ifdef CONFIG_ZX55Q05_ONLY
+#include <linux/alarmtimer.h>
+#include <linux/wakelock.h>
+#endif
+
 #define _SMB1360_MASK(BITS, POS) \
 	((unsigned char)(((1 << (BITS)) - 1) << (POS)))
 #define SMB1360_MASK(LEFT_BIT_POS, RIGHT_BIT_POS) \
@@ -249,6 +254,29 @@
 #define FG_RESET_THRESHOLD_MV		15
 #define SMB1360_REV_1			0x01
 
+#ifdef CONFIG_ZX55Q05_ONLY
+#define HIPAD_CAPACITY_THRESHOLD 5  //10
+#define HIPAD_TERM_THRESHOLD   8
+#define HIPAD_BATTERY_FULL_THRESHOLD  10  // 10*15*7s
+#define TEMP_CHECK_PERIOD_START_MS	30000//30000
+#define HIPAD_DELTA_TEMP	30//(370)
+#define TEMP_CHECK_PERIOD_HOLD_MS	7000 //30000
+#define TEMP_CHECK_PERIOD_DISCHARGE_MS	5000 //30000
+#define HIPAD_VOLTAGE_COMPENSATION  35  // 35mv
+#define POWER_STAGE_REDUCE_CHECK_PERIOD_NS		(30LL * NSEC_PER_SEC)
+#define TEMP_CHECK_PERIOD_ALARM_MS	2000//30000
+#define SAMPLE_TEMP_COUNT 5
+#define WORK_THRESHOLD   25
+int current_buffer[SAMPLE_TEMP_COUNT];
+#define READ_DELAY_NUM   (3)
+#define BATTERY_PERNUM_OFFSET (8)
+#define BATTERY_DECREASE_PERNUM_OFFSET (3)
+#define USB_TYPE 4
+#define AC_TYPE 5
+#endif
+
+#define pr_log(fmt, arg...)	printk("SMB %s: " fmt, __func__, ##arg)
+
 #define SMB1360_POWERON_DELAY_MS	2000
 #define SMB1360_FG_RESET_DELAY_MS	1500
 
@@ -330,6 +358,22 @@ struct smb1360_chip {
 	u8				soft_hot_rt_stat;
 	u8				soft_cold_rt_stat;
 	struct delayed_work		jeita_work;
+
+#ifdef CONFIG_ZX55Q05_ONLY
+	struct delayed_work		adjust_charging_soc_work;
+	atomic_t 			hipad_lock_enable;
+	int      	                hipad_voltage_first;
+	int 				hipad_capacity;
+	int 				capcity_reference;
+	int 				term_count;
+	bool              	        charger_overvoltage;
+	bool              	        use_voltage;
+	bool              	        hipad_is_full;
+	int				last_temp;
+	int 				is_pvt1;
+	int 				is_pvt2;
+	struct delay_work		temp_work;
+#endif
 	struct delayed_work		delayed_init_work;
 	unsigned short			default_i2c_addr;
 	unsigned short			fg_i2c_addr;
@@ -455,6 +499,10 @@ struct smb1360_chip {
 	int				cold_hysteresis;
 	int				hot_hysteresis;
 };
+
+#ifdef CONFIG_ZX55Q05_ONLY
+static struct wake_lock hipad_chg_wake_lock;
+#endif
 
 static int chg_time[] = {
 	192,
@@ -1151,8 +1199,22 @@ static int smb1360_get_prop_batt_status(struct smb1360_chip *chip)
 	if (is_device_suspended(chip))
 		return POWER_SUPPLY_STATUS_UNKNOWN;
 
+#ifdef CONFIG_ZX55Q05_ONLY
+	if(chip->use_voltage)
+	{
+		if(chip->usb_present && (chip->hipad_capacity== 100))
+		  return POWER_SUPPLY_STATUS_FULL;
+	}
+	else
+	{
+		if ((chip->usb_present && chip->soc_now == 100) ||
+			chip->batt_full)
+			return POWER_SUPPLY_STATUS_FULL;
+	}
+#else
 	if (chip->batt_full)
 		return POWER_SUPPLY_STATUS_FULL;
+#endif
 
 	rc = smb1360_read(chip, STATUS_3_REG, &reg);
 	if (rc) {
@@ -1161,7 +1223,7 @@ static int smb1360_get_prop_batt_status(struct smb1360_chip *chip)
 	}
 
 	pr_debug("STATUS_3_REG = %x\n", reg);
-
+#ifndef CONFIG_ZX55Q05_ONLY
 	if (reg & CHG_HOLD_OFF_BIT)
 		return POWER_SUPPLY_STATUS_NOT_CHARGING;
 
@@ -1173,6 +1235,58 @@ static int smb1360_get_prop_batt_status(struct smb1360_chip *chip)
 		return POWER_SUPPLY_STATUS_CHARGING;
 }
 
+#else
+	if(chip->use_voltage )
+	{
+		if( chip->usb_present && (chip->hipad_capacity != 100) &&  !chip->charger_overvoltage
+			 && !chip->batt_hot && !chip->batt_cold)
+		{
+			return POWER_SUPPLY_STATUS_CHARGING;
+		}
+		else
+		{
+			if (reg & CHG_HOLD_OFF_BIT)
+				return POWER_SUPPLY_STATUS_NOT_CHARGING;
+
+			chg_type = (reg & CHG_TYPE_MASK) >> CHG_TYPE_SHIFT;
+
+			if (chg_type == BATT_NOT_CHG_VAL)
+				return POWER_SUPPLY_STATUS_DISCHARGING;
+			else
+				return POWER_SUPPLY_STATUS_CHARGING;
+		}
+	}
+	else
+	{
+
+
+		if (reg & CHG_HOLD_OFF_BIT)
+			return POWER_SUPPLY_STATUS_NOT_CHARGING;
+
+		chg_type = (reg & CHG_TYPE_MASK) >> CHG_TYPE_SHIFT;
+
+		if (chg_type == BATT_NOT_CHG_VAL)
+			return POWER_SUPPLY_STATUS_DISCHARGING;
+		else
+			return POWER_SUPPLY_STATUS_CHARGING;
+    	}
+}
+
+static int smb1360_get_prop_charging_status(struct smb1360_chip *chip)
+{
+	int rc;
+	u8 reg = 0;
+
+	rc = smb1360_read(chip, STATUS_3_REG, &reg);
+	if (rc) {
+		pr_err("Couldn't read STATUS_3_REG rc=%d\n", rc);
+		return 0;
+	}
+
+	return (reg & CHG_EN_BIT) ? 1 : 0;
+}
+
+#endif
 static int smb1360_get_prop_charge_type(struct smb1360_chip *chip)
 {
 	int rc;
@@ -1200,10 +1314,24 @@ static int smb1360_get_prop_charge_type(struct smb1360_chip *chip)
 	return POWER_SUPPLY_CHARGE_TYPE_NONE;
 }
 
+#ifdef CONFIG_ZX55Q05_ONLY
+static int smb1360_get_prop_batt_temp(struct smb1360_chip *chip);
+static int smb1360_get_prop_batt_capacity(struct smb1360_chip *chip);
+static int smb1360_get_prop_voltage_now(struct smb1360_chip *chip);
+static int hipad_vol_to_percent(struct smb1360_chip *chip, int  voltage,int status, int capacity,
+			     int update);
+static int log_flag = 0;
+#endif
+
 static int smb1360_get_prop_batt_health(struct smb1360_chip *chip)
 {
 	union power_supply_propval ret = {0, };
-
+#ifdef CONFIG_ZX55Q05_ONLY
+	int hipad_capacity = smb1360_get_prop_batt_capacity(chip);
+	int hipad_voltage =  smb1360_get_prop_voltage_now(chip);
+	int status = smb1360_get_prop_charging_status(chip);
+	smb1360_get_prop_batt_temp(chip);
+#endif
 	if (chip->batt_hot)
 		ret.intval = POWER_SUPPLY_HEALTH_OVERHEAT;
 	else if (chip->batt_cold)
@@ -1212,9 +1340,24 @@ static int smb1360_get_prop_batt_health(struct smb1360_chip *chip)
 		ret.intval = POWER_SUPPLY_HEALTH_WARM;
 	else if (chip->batt_cool)
 		ret.intval = POWER_SUPPLY_HEALTH_COOL;
+#ifdef CONFIG_ZX55Q05_ONLY
+	else if (chip->charger_overvoltage)
+		ret.intval = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
+#endif
 	else
 		ret.intval = POWER_SUPPLY_HEALTH_GOOD;
 
+#ifdef CONFIG_ZX55Q05_ONLY
+	if(hipad_capacity > 90 && chip->usb_present) {
+		log_flag++;
+		if(log_flag == 20){
+			pr_log("health=%d,temp=%d,current=%d,capacity=%d,voltage=%d,charge_status=%d,use_voltage=%d\n", ret.intval,chip->temp_now, chip->current_now,hipad_capacity,hipad_voltage,status,chip->use_voltage);
+			log_flag = 0;
+		}
+	} else {
+		pr_log("health=%d,temp=%d,current=%d,capacity=%d,voltage=%d,charge_status=%d,use_voltage=%d\n", ret.intval,chip->temp_now, chip->current_now,hipad_capacity,hipad_voltage,status,chip->use_voltage);
+	}
+#endif
 	return ret.intval;
 }
 
@@ -1223,6 +1366,10 @@ static int smb1360_get_prop_batt_capacity(struct smb1360_chip *chip)
 	u8 reg;
 	u32 temp = 0;
 	int rc, soc = 0;
+#ifdef CONFIG_ZX55Q05_ONLY
+	static bool is_first = false;
+	int status;
+#endif
 
 	if (chip->fake_battery_soc >= 0)
 		return chip->fake_battery_soc;
@@ -1233,7 +1380,20 @@ static int smb1360_get_prop_batt_capacity(struct smb1360_chip *chip)
 	}
 
 	if (is_device_suspended(chip))
+	{
+#ifdef CONFIG_ZX55Q05_ONLY
+		if(chip->use_voltage)
+		{
+		 	return chip->hipad_capacity;
+		}
+		else
+		{
+			return chip->soc_now;
+		}
+#else
 		return chip->soc_now;
+#endif
+	}
 
 	rc = smb1360_read(chip, SHDW_FG_MSYS_SOC, &reg);
 	if (rc) {
@@ -1251,7 +1411,32 @@ static int smb1360_get_prop_batt_capacity(struct smb1360_chip *chip)
 
 	chip->soc_now = (chip->batt_full ? 100 : bound(soc, 0, 100));
 
+#ifndef CONFIG_ZX55Q05_ONLY
 	return chip->soc_now;
+#else
+	if(!is_first && chip->use_voltage )
+	{
+		chip->hipad_voltage_first = smb1360_get_prop_voltage_now(chip) / 1000 ;
+		if(!chip->usb_present)
+		{
+			chip->hipad_voltage_first = chip->hipad_voltage_first + HIPAD_VOLTAGE_COMPENSATION;
+		}
+		status = smb1360_get_prop_charging_status(chip);
+		chip->hipad_capacity = hipad_vol_to_percent(chip,chip->hipad_voltage_first ,status,chip->soc_now ,0);
+		schedule_delayed_work(&chip->adjust_charging_soc_work, msecs_to_jiffies(TEMP_CHECK_PERIOD_START_MS));
+	}
+
+	is_first = true;
+
+	if(chip->use_voltage )
+	{
+		return chip->hipad_capacity;
+	}
+	else
+	{
+		return chip->soc_now;
+	}
+#endif
 }
 
 static int smb1360_get_prop_chg_full_design(struct smb1360_chip *chip)
@@ -1277,6 +1462,11 @@ static int smb1360_get_prop_chg_full_design(struct smb1360_chip *chip)
 	return chip->fcc_mah;
 }
 
+#ifdef CONFIG_ZX55Q05_ONLY
+#define  HIPAD_HIGH_TEMP_THRESHOLD    120
+#define  HIPAD_TEMP_COMPENSATION   30
+#endif
+
 static int smb1360_get_prop_batt_temp(struct smb1360_chip *chip)
 {
 	u8 reg[2];
@@ -1299,7 +1489,9 @@ static int smb1360_get_prop_batt_temp(struct smb1360_chip *chip)
 					reg[0], reg[1], temp);
 
 	chip->temp_now = temp;
-
+#ifdef CONFIG_ZX55Q05_ONLY
+	chip->temp_now -= HIPAD_TEMP_COMPENSATION;
+#endif
 	return chip->temp_now;
 }
 
@@ -1376,7 +1568,11 @@ static int smb1360_get_prop_current_now(struct smb1360_chip *chip)
 				reg[0], reg[1], temp * 1000);
 
 	chip->current_now = temp * 1000;
-
+#ifdef CONFIG_ZX55Q05_ONLY
+	if(chip->use_voltage )
+	   	if (smb1360_get_prop_charging_status(chip))
+			chip->current_now -= 300*1000;
+#endif
 	return chip->current_now;
 }
 
@@ -1519,6 +1715,23 @@ static void smb1360_parallel_work(struct work_struct *work)
 exit_work:
 	smb1360_relax(&chip->smb1360_ws, WAKEUP_SRC_PARALLEL);
 }
+
+#ifdef CONFIG_ZX55Q05_ONLY
+static void smb1360_temp_work(struct work_struct *work)
+{
+	int value;
+	struct smb1360_chip *chip = container_of(work,
+				struct smb1360_chip, temp_work.work);
+
+	value = smb1360_get_prop_batt_temp(chip);
+	if (value != chip->last_temp) {
+		power_supply_changed(&chip->batt_psy);
+		chip->last_temp = value;
+	}
+
+	schedule_delayed_work(&chip->temp_work, 5*HZ);
+}
+#endif
 
 static int smb1360_set_appropriate_usb_current(struct smb1360_chip *chip)
 {
@@ -1937,6 +2150,485 @@ static int smb1360_battery_is_writeable(struct power_supply *psy,
 	return rc;
 }
 
+#ifdef CONFIG_ZX55Q05_ONLY
+#define BATTERY_CAPACITY_INIT_SHAKING_MAX 20
+#define BATTERY_CAPACITY_RUN_SHAKING_MAX  4
+#define BATTERY_ABS(a,b) ((a)>=(b)?((a)-(b)):((b)-(a)))
+#define BATTERY_MONITOR_LEVEL 0
+#define BATTERY_MONITOR_COUNT (0x1f >> BATTERY_MONITOR_LEVEL)
+
+
+enum BATTERY_ENUM
+{
+	BATTERY_CAPACITY_INIT,
+	BATTERY_CAPACITY_MONITOR,
+};
+
+int voltage_capacity_table[][2] = {
+	{4280, 100},
+	{4195, 90},
+	{4100, 80},
+	{4004, 70},
+	{3918, 60},
+	{3844, 50},
+	{3802, 40},
+	{3770, 30},
+	{3739, 20},
+	{3689, 15},
+	{3600, 5},
+	{3370, 0},
+};
+
+int ac_charging_voltage_capacity_table[][2] = {
+	{4330, 100},
+	{4290, 90},
+	{4240, 80},
+	{4164, 70},
+	{4088, 60},
+	{4014, 50},
+	{3972, 40},
+	{3940, 30},
+	{3899, 20},
+	{3849, 15},
+	{3760, 5},
+	{3250, 0},
+};
+
+int usb_charging_voltage_capacity_table[][2] = {
+	{4320, 100},
+	{4240, 90},
+	{4167, 80},
+	{4074, 70},
+	{3988, 60},
+	{3914, 50},
+	{3872, 40},
+	{3840, 30},
+	{3809, 20},
+	{3769, 15},
+	{3700, 5},
+	{3250, 0},
+};
+
+static bool hipad_is_usb(struct smb1360_chip *chip)
+{
+	bool is_usb =false;
+	int rc,charge_type = 0;
+	union power_supply_propval prop;
+	if (chip->usb_present)
+	{
+		rc = chip->usb_psy->get_property(chip->usb_psy,
+				POWER_SUPPLY_PROP_TYPE, &prop);
+		if (rc < 0)
+			dev_err(chip->dev,
+					"could not read USB type property, rc=%d\n", rc);
+		else
+			charge_type = prop.intval ;
+		if(charge_type == USB_TYPE)
+			is_usb = true;
+		else if(charge_type ==AC_TYPE)
+			is_usb = false;
+		return is_usb;
+	}
+	else
+	{
+		return false;
+	}
+}
+
+static int hipad_vol_to_percent(struct smb1360_chip *chip, int  voltage,int status, int capacity,
+			     int update)
+{
+	int percentum;
+	int temp;
+	int table_size;
+	int pos = 0;
+	static int pre_percentum = 0xffff;
+	bool  is_usb = hipad_is_usb(chip);
+	static uint8_t read_voltage_delay_time = 0;
+#ifdef DEBUG_CHGMNG
+	static int print_percent_time = 0;
+#endif
+	static int battery_percentum=0;
+	static enum BATTERY_ENUM battery_status = BATTERY_CAPACITY_INIT;
+	static int	percentum_old=0;
+	static int	percentum_min= 0;
+	static char battery_count=0;
+	static char hipad_battery_full_count=0;
+	static int last_status = 0;
+	static bool percentum_flag = false;
+	battery_count++;
+	battery_count = battery_count & (BATTERY_MONITOR_COUNT >> 1);
+	battery_percentum = capacity;
+	if(chip->soc_max == -EINVAL)
+	{
+		battery_status = BATTERY_CAPACITY_MONITOR;
+	}
+
+	if(last_status != status)
+	{
+		read_voltage_delay_time = 0;
+		last_status = status;
+	}
+
+	if (update) {
+		pre_percentum = 0xffff;
+		return 0;
+	}
+
+	if (status)
+	{
+		if(chip->batt_full)
+		{
+			percentum = percentum_old = pre_percentum = 100;
+		}
+		else
+		{
+		 if (is_usb) {
+			table_size = ARRAY_SIZE(usb_charging_voltage_capacity_table);
+			for (pos = table_size - 1; pos > 0; pos--) {
+				if (voltage < usb_charging_voltage_capacity_table[pos][0])
+					break;
+			}
+			if (pos == table_size - 1) {
+				percentum = 0;
+			} else {
+				temp = usb_charging_voltage_capacity_table[pos][1] - usb_charging_voltage_capacity_table[pos + 1][1];
+				temp = temp * (voltage - usb_charging_voltage_capacity_table[pos][0]);
+				temp = temp / (usb_charging_voltage_capacity_table[pos][0] - usb_charging_voltage_capacity_table[pos + 1][0]);
+				temp = temp + usb_charging_voltage_capacity_table[pos][1];
+				if (temp > 100)
+					temp = 100;
+				percentum = temp;
+
+			}
+		} else {
+			table_size = ARRAY_SIZE(ac_charging_voltage_capacity_table);
+			for (pos = table_size - 1; pos > 0; pos--) {
+				if (voltage < ac_charging_voltage_capacity_table[pos][0])
+					break;
+			}
+			if (pos == table_size - 1) {
+				percentum = 0;
+			} else {
+				temp = ac_charging_voltage_capacity_table[pos][1] - ac_charging_voltage_capacity_table[pos + 1][1];
+				temp = temp * (voltage - ac_charging_voltage_capacity_table[pos][0]);
+				temp = temp / (ac_charging_voltage_capacity_table[pos][0] - ac_charging_voltage_capacity_table[pos + 1] [0]);
+				temp = temp + ac_charging_voltage_capacity_table[pos][1];
+				if (temp > 100)
+					temp = 100;
+				percentum = temp;
+			}
+		}
+
+		if (pre_percentum == 0xffff)
+			pre_percentum = percentum;
+		else if (pre_percentum > percentum) {
+			percentum = pre_percentum;
+			read_voltage_delay_time = 0;
+		}
+		else if(pre_percentum <= percentum)
+		{
+			/*We must wait at least READ_DELAY_NUM when percentum changes over BATTERY_PERNUM_OFFSET,Sept 04th,2013. */
+			if(((percentum - pre_percentum) > BATTERY_PERNUM_OFFSET) && (read_voltage_delay_time < READ_DELAY_NUM))
+			{
+				percentum = pre_percentum;
+				read_voltage_delay_time ++;
+			}
+			else
+			{
+				pre_percentum = percentum;
+				read_voltage_delay_time = 0;
+			}
+		}
+	}
+   } else {
+		table_size = ARRAY_SIZE(voltage_capacity_table);
+		for (pos = 0; pos < table_size - 1; pos++) {
+			if (voltage > voltage_capacity_table[pos][0])
+				break;
+		}
+		if (pos == 0) {
+			percentum = 100;
+		} else {
+			temp = voltage_capacity_table[pos][1] - voltage_capacity_table[pos - 1][1];
+			temp = temp * (voltage - voltage_capacity_table[pos][0]);
+			temp = temp / (voltage_capacity_table[pos][0] -	voltage_capacity_table[pos - 1][0]);
+			temp = temp + voltage_capacity_table[pos][1];
+			if (temp < 0)
+				temp = 0;
+			percentum = temp;
+		}
+		if (pre_percentum == 0xffff)
+			pre_percentum = percentum;
+		else if (pre_percentum < percentum)
+		{
+			if(percentum_flag)
+			{
+				percentum_flag = false;
+				read_voltage_delay_time = 0;
+			}
+			if(read_voltage_delay_time < READ_DELAY_NUM)
+			{
+				percentum = pre_percentum;
+				read_voltage_delay_time ++;
+			}
+			else
+			{
+				pre_percentum = percentum;
+				read_voltage_delay_time = 0;
+			}
+		}
+		else if (pre_percentum >= percentum) {
+		/*We must wait at least READ_DELAY_NUM when percentum changes over BATTERY_PERNUM_OFFSET,Sept 04th,2013. */
+			if(!percentum_flag)
+			{
+				percentum_flag = true;
+				read_voltage_delay_time = 0;
+			}
+
+			if(((pre_percentum - percentum) > BATTERY_DECREASE_PERNUM_OFFSET) || (percentum > battery_percentum))
+			{
+				if(read_voltage_delay_time >=  READ_DELAY_NUM)
+				{
+					pre_percentum= percentum;
+					read_voltage_delay_time = 0;
+				}
+				else
+				{
+					percentum = pre_percentum;
+					read_voltage_delay_time ++;
+				}
+			}
+			else
+			{
+				pre_percentum= percentum;
+				read_voltage_delay_time = 0;
+			}
+		}
+	}
+	switch(battery_status)
+	{
+	case BATTERY_CAPACITY_INIT:
+		pr_log("capcity_reference=%d,percentum=%d\n",chip->capcity_reference,percentum);
+			percentum_old = percentum;
+			battery_status=BATTERY_CAPACITY_MONITOR;
+			if(percentum<=5)
+			{
+				battery_percentum = percentum;
+				return  battery_percentum;
+			}
+
+			if(chip->capcity_reference == 100)
+			{	
+				battery_percentum = percentum;
+			}
+			else if((chip->capcity_reference != 85) &&(chip->capcity_reference != 0) )
+			{
+				if(chip->capcity_reference == 99)
+				{
+					chip->capcity_reference = 100;
+				}
+				battery_percentum = chip->capcity_reference;
+			}
+			else
+			{
+					battery_percentum=percentum;
+			}
+			percentum_min = battery_percentum;
+	break;
+	case BATTERY_CAPACITY_MONITOR:
+			{
+				if( BATTERY_ABS(percentum, percentum_old) <= BATTERY_CAPACITY_RUN_SHAKING_MAX)
+				{
+					if(status)
+					{
+						if(chip->batt_full && (battery_percentum < 100))
+						{
+							if((battery_count & (BATTERY_MONITOR_COUNT  >> 2))== 0)
+							{
+								battery_percentum++;
+								battery_count = 0;
+							}
+						}
+						else
+						{
+							if(battery_percentum < percentum)
+							{
+								if((percentum  >= (battery_percentum + HIPAD_CAPACITY_THRESHOLD)))
+								{
+									if((battery_count & (BATTERY_MONITOR_COUNT >> 3))== 0)
+									{
+										battery_percentum++;
+										battery_count = 0;
+									}
+								}
+								else if(percentum > 90)
+								{
+									if((battery_count & BATTERY_MONITOR_COUNT )== 0)
+									{
+										battery_percentum++;
+										battery_count = 0;
+									}
+								}
+								else
+								{
+									if(battery_count == 0)
+										battery_percentum++;
+								}
+							}
+							else	if(battery_percentum > percentum)
+							{
+							}
+							else
+							{
+								battery_count=0;
+							}
+
+							if(!chip->batt_full && (battery_percentum == 100) && (capacity != 100))
+							{
+								if(hipad_battery_full_count >= HIPAD_BATTERY_FULL_THRESHOLD)
+								{
+									battery_percentum = 100;		
+								}
+								else
+								{
+									battery_percentum = 99;	
+									hipad_battery_full_count++;
+								}
+							}
+					   }	
+  						percentum_min = battery_percentum;
+					}
+					else
+					{
+						if(battery_percentum > percentum)
+						{
+							if (percentum <=10)
+							{
+								if((battery_count & (BATTERY_MONITOR_COUNT >> 4))== 0)
+								{
+									battery_percentum--;
+									battery_count = 0;
+								}
+							}
+							else
+							{
+								if((battery_count & (BATTERY_MONITOR_COUNT >> 2))== 0)
+								{
+									battery_percentum--;
+									battery_count = 0;
+								}
+							}
+
+						}
+						else if (battery_percentum < percentum)
+						{
+							if((percentum  >= (battery_percentum + 4)) && (percentum_old > percentum) && (percentum_min > percentum))
+							{
+								if(battery_percentum > 1)
+								{
+									battery_percentum--;
+									percentum_min = percentum;
+								}
+							}
+						}
+						else
+						{
+							battery_count=0;
+						}
+						hipad_battery_full_count = 0;
+					}
+				}
+				else
+				{
+				}
+				percentum_old = percentum;
+			}
+			break;
+	}
+#ifdef DEBUG_CHGMNG
+	print_percent_time ++;
+	print_percent_time %= VBAT_CAPACITY_BUFF_CNT;
+	if(0 == print_percent_time)
+	{
+		printk("%s[%d]:is_charging=%d,voltage=%d,battery_percentum=%d\r\n",
+				__FUNCTION__,__LINE__,status,voltage,battery_percentum);
+	}
+#endif
+	return battery_percentum;
+}
+static void hipad_adjust_charging_soc_work(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct smb1360_chip *chip = container_of(dwork,
+				struct smb1360_chip, adjust_charging_soc_work);
+	static int work_count =0;
+	int last_capacity = chip->hipad_capacity;
+	int hipad_voltage;
+	int hipad_current;
+	int status;
+	int voltage_offset =0;
+	int pre_lock_enable = atomic_read(&chip->hipad_lock_enable);
+	if(chip->usb_present)
+	{
+		if(pre_lock_enable == 0)
+		{
+			wake_lock(&hipad_chg_wake_lock);
+			atomic_set(&chip->hipad_lock_enable, 1);
+		}
+	}
+	else
+	{
+		if(pre_lock_enable == 1)
+		{
+			wake_unlock(&hipad_chg_wake_lock);
+			atomic_set(&chip->hipad_lock_enable, 0);
+		}
+	}
+	
+	if (!is_device_suspended(chip))
+	{
+		 if((chip->soc_max != -EINVAL) && (work_count  < WORK_THRESHOLD) )
+	 	{
+	 		hipad_voltage = chip->hipad_voltage_first ;
+			work_count ++;
+	 	}
+		 else
+	 	{
+	 		hipad_voltage = smb1360_get_prop_voltage_now(chip) / 1000;
+			hipad_current = smb1360_get_prop_current_now(chip)/1000;
+			if(!chip->usb_present)
+			{
+				voltage_offset = DIV_ROUND_CLOSEST(hipad_current,100) *11;
+			}  
+			else
+			{
+				voltage_offset = 0 ;
+			}  
+
+			hipad_voltage = hipad_voltage + voltage_offset;			
+	 	}
+		status = smb1360_get_prop_charging_status(chip);			
+		chip->hipad_capacity = hipad_vol_to_percent(chip,hipad_voltage,status,last_capacity,0);
+	}	
+
+	if(last_capacity != chip->hipad_capacity)
+	{		
+		power_supply_changed(&chip->batt_psy);	
+	}	
+	
+	if(chip->usb_present)
+	{
+		schedule_delayed_work(&chip->adjust_charging_soc_work, msecs_to_jiffies(TEMP_CHECK_PERIOD_HOLD_MS));	
+	}
+	else
+	{
+		schedule_delayed_work(&chip->adjust_charging_soc_work, msecs_to_jiffies(TEMP_CHECK_PERIOD_DISCHARGE_MS));
+	}
+
+}
+#endif
+
 static int smb1360_battery_get_property(struct power_supply *psy,
 				       enum power_supply_property prop,
 				       union power_supply_propval *val)
@@ -2124,7 +2816,9 @@ static void smb1360_jeita_work_fn(struct work_struct *work)
 	struct smb1360_chip *chip = container_of(dwork, struct smb1360_chip,
 							jeita_work);
 	temp = smb1360_get_prop_batt_temp(chip);
-
+#ifdef CONFIG_ZX55Q05_ONLY
+	temp  +=HIPAD_TEMP_COMPENSATION;
+#endif
 	if (temp > chip->hot_bat_decidegc) {
 		/* battery status is hot, only config thresholds */
 		rc = smb1360_set_soft_jeita_threshold(chip,
@@ -2162,9 +2856,11 @@ static void smb1360_jeita_work_fn(struct work_struct *work)
 			dev_err(chip->dev, "Couldn't set float voltage\n");
 			goto end;
 		}
+#ifdef CONFIG_ZX55Q05_ONLY
 		rc = smb1360_set_appropriate_usb_current(chip);
 		if (rc)
 			pr_err("Couldn't set USB current\n");
+#endif
 		rc = smb1360_set_soft_jeita_threshold(chip,
 			chip->cool_bat_decidegc, chip->warm_bat_decidegc);
 		if (rc) {
@@ -2180,6 +2876,9 @@ static void smb1360_jeita_work_fn(struct work_struct *work)
 			dev_err(chip->dev, "Couldn't set float voltage\n");
 			goto end;
 		}
+		rc = smb1360_set_appropriate_usb_current(chip);
+		if (rc)
+			pr_err("Couldn't set USB current\n");
 		rc = smb1360_set_soft_jeita_threshold(chip,
 			chip->cold_bat_decidegc, chip->cool_bat_decidegc);
 		if (rc) {
@@ -2277,7 +2976,24 @@ static int chg_term_handler(struct smb1360_chip *chip, u8 rt_stat)
 {
 	pr_debug("rt_stat = 0x%02x\n", rt_stat);
 	chip->batt_full = !!rt_stat;
-
+#ifdef CONFIG_ZX55Q05_ONLY
+	if(chip->usb_present && !chip->batt_full &&  !chip->use_voltage && (chip->soc_now < 100) )
+   	{
+   		if(chip->term_count >= HIPAD_TERM_THRESHOLD)
+		{	chip->use_voltage = true;
+			chip->hipad_capacity = chip->soc_now;
+			schedule_delayed_work(&chip->adjust_charging_soc_work, msecs_to_jiffies(TEMP_CHECK_PERIOD_HOLD_MS));	
+   		}
+		else
+		{
+			chip->term_count ++;
+		}
+	}
+	else
+	{
+		chip->term_count = 0;
+	}
+#endif
 	if (chip->parallel_charging) {
 		pr_debug("%s parallel-charging\n", chip->batt_full ?
 					"Disable" : "Enable");
@@ -2291,7 +3007,6 @@ static int chg_term_handler(struct smb1360_chip *chip, u8 rt_stat)
 static int chg_fastchg_handler(struct smb1360_chip *chip, u8 rt_stat)
 {
 	pr_debug("rt_stat = 0x%02x\n", rt_stat);
-
 	return 0;
 }
 
@@ -2311,10 +3026,25 @@ static int usbin_uv_handler(struct smb1360_chip *chip, u8 rt_stat)
 		/* USB inserted */
 		chip->usb_present = usb_present;
 		power_supply_set_present(chip->usb_psy, usb_present);
-	}
 
+	}
+    return 0;
+}
+
+#ifdef CONFIG_ZX55Q05_ONLY
+static int usbin_ov_handler(struct smb1360_chip *chip, u8 rt_stat)
+{
+	pr_log("USB overvoltage %d\n",rt_stat);
+	chip->charger_overvoltage = !!rt_stat;
 	return 0;
 }
+
+static int saftety_handler(struct smb1360_chip *chip, u8 rt_stat)
+{
+	pr_log("saftety_handler %d\n",rt_stat);
+	return 0;
+}
+#endif
 
 static int aicl_done_handler(struct smb1360_chip *chip, u8 rt_stat)
 {
@@ -2349,6 +3079,14 @@ static int delta_soc_handler(struct smb1360_chip *chip, u8 rt_stat)
 
 	return 0;
 }
+
+#ifdef CONFIG_ZX55Q05_ONLY
+static int chg_error_handler(struct smb1360_chip *chip, u8 rt_stat)
+{
+	pr_log("SOC changed! - rt_stat = 0x%02x\n", rt_stat);
+	return 0;
+}
+#endif
 
 static int min_soc_handler(struct smb1360_chip *chip, u8 rt_stat)
 {
@@ -2658,6 +3396,9 @@ static struct irq_handler_info handlers[] = {
 			},
 			{
 				.name		= "safety_timeout",
+#ifdef CONFIG_ZX55Q05_ONLY
+				.smb_irq	= saftety_handler,
+#endif
 			},
 			{
 				.name		= "aicl_done",
@@ -2676,6 +3417,10 @@ static struct irq_handler_info handlers[] = {
 			},
 			{
 				.name		= "usbin_ov",
+#ifdef CONFIG_ZX55Q05_ONLY
+				.smb_irq = usbin_ov_handler,
+#endif
+
 			},
 			{
 				.name		= "unused",
@@ -2712,6 +3457,9 @@ static struct irq_handler_info handlers[] = {
 			},
 			{
 				.name		= "chg_error",
+#ifdef CONFIG_ZX55Q05_ONLY
+				.smb_irq	= chg_error_handler,
+#endif
 			},
 			{
 				.name		= "wd_timeout",
@@ -3438,6 +4186,10 @@ static int smb1360_check_batt_profile(struct smb1360_chip *chip)
 				(div_u64(chip->connected_rid, 10)))
 			break;
 	}
+
+#ifdef CONFIG_ZX55Q05_ONLY
+	i = 1;
+#endif
 
 	if (i == BATTERY_PROFILE_MAX) {
 		pr_err("None of the battery-profiles match the connected-RID\n");
@@ -4670,6 +5422,18 @@ static int smb1360_parse_parallel_charging_params(struct smb1360_chip *chip)
 static int smb_parse_dt(struct smb1360_chip *chip)
 {
 	int rc;
+#ifdef CONFIG_ZX55Q05_ONLY
+	int is_pvt1;
+	int is_pvt2;
+	int value_108;
+	int value_109;
+	int pcb_check;
+	int pcb_check1;
+	u32 pcb_check_flags;
+	u32 pcb_check_flags1;
+	int err = 0;
+	int i = 0;
+#endif
 	struct device_node *node = chip->dev->of_node;
 
 	if (!node) {
@@ -4678,6 +5442,65 @@ static int smb_parse_dt(struct smb1360_chip *chip)
 	}
 
 	chip->rsense_10mohm = of_property_read_bool(node, "qcom,rsense-10mhom");
+
+#ifdef CONFIG_ZX55Q05_ONLY
+	pcb_check = of_get_named_gpio_flags(node, "hipad,pcb-check",	0, &pcb_check_flags);
+
+	if (pcb_check > 0)
+	{
+		pr_info("find dts property pcb check gpio\n");
+	}
+
+	err = gpio_request(pcb_check, "pcb_check_gpio");
+
+	if (err) {
+		pr_err("request pcb_check_gpio failed");
+	}
+
+
+	pcb_check1 = of_get_named_gpio_flags(node, "hipad,pcb-check1",	0, &pcb_check_flags1);
+
+	if (pcb_check1 > 0)
+	{
+		pr_info("find dts property pcb check gpio\n");
+	}
+
+	err = gpio_request(pcb_check1, "pcb_check_gpio1");
+
+	if (err) {
+		pr_err("request pcb_check_gpio failed");
+	}
+
+
+	printk("pcb_check = %d,pcb_check1 = %d\n",pcb_check,pcb_check1);
+	for(i = 0; i < 5; i ++)
+	{
+		mdelay(10);
+		value_108 = gpio_get_value(pcb_check);
+		value_109 = gpio_get_value(pcb_check1);
+	}
+
+	if((value_108==1)&&(value_109==0))
+    	{
+		is_pvt1=1;
+		is_pvt2=0;
+		chip->is_pvt1 = is_pvt1;
+		chip->is_pvt2 = is_pvt2;
+    	}
+	else if((value_108==1)&&(value_109==1))
+	 {
+		is_pvt2=1;
+		is_pvt1=0;
+		chip->is_pvt1 = is_pvt1;
+		chip->is_pvt2 = is_pvt2;
+	 }
+	else if ((value_108==0)&&(value_109==0))
+	{
+		pr_info(" === %s === pcb is evt!!!\n", __func__);
+		chip->rsense_10mohm = NULL;
+	}
+#endif
+
 
 	if (of_property_read_bool(node, "qcom,batt-profile-select")) {
 		rc = smb_parse_batt_id(chip);
@@ -4711,6 +5534,13 @@ static int smb_parse_dt(struct smb1360_chip *chip)
 		}
 	}
 
+#ifdef CONFIG_ZX55Q05_ONLY
+	if(((chip->is_pvt1==1)&&(chip->is_pvt2==0)) ||  (85 != chip->capcity_reference))
+ 	{
+ 		chip->use_voltage = true;
+ 	}
+#endif
+
 	chip->pulsed_irq = of_property_read_bool(node, "qcom,stat-pulsed-irq");
 
 	rc = of_property_read_u32(node, "qcom,float-voltage-mv",
@@ -4737,10 +5567,30 @@ static int smb_parse_dt(struct smb1360_chip *chip)
 	chip->recharge_disabled = of_property_read_bool(node,
 						"qcom,recharge-disabled");
 
+#ifdef CONFIG_ZX55Q05_ONLY
+	 if(chip->use_voltage)
+	 {
+	 	rc = of_property_read_u32(node, "qcom,iterm-ma", &chip->iterm_ma);
+		if (rc < 0)
+		{
+			chip->iterm_ma = -EINVAL;
+		}
+		else
+		{
+			chip->iterm_ma = 100;
+		}
+	 }
+	else
+	{
+		rc = of_property_read_u32(node, "qcom,iterm-ma", &chip->iterm_ma);
+		if (rc < 0)
+			chip->iterm_ma = -EINVAL;
+	 }
+#else
 	rc = of_property_read_u32(node, "qcom,iterm-ma", &chip->iterm_ma);
 	if (rc < 0)
 		chip->iterm_ma = -EINVAL;
-
+#endif
 	chip->iterm_disabled = of_property_read_bool(node,
 						"qcom,iterm-disabled");
 
@@ -4803,10 +5653,19 @@ static int smb_parse_dt(struct smb1360_chip *chip)
 	if (rc < 0)
 		chip->delta_soc = -EINVAL;
 
+#ifdef CONFIG_ZX55Q05_ONLY
+	chip->soc_max = -EINVAL;
+	if(chip->use_voltage)
+	{
+		 rc = of_property_read_u32(node, "qcom,fg-soc-max", &chip->soc_max);
+		if (rc < 0)
+			chip->soc_max = -EINVAL;
+	}
+#else
 	rc = of_property_read_u32(node, "qcom,fg-soc-max", &chip->soc_max);
 	if (rc < 0)
 		chip->soc_max = -EINVAL;
-
+#endif
 	rc = of_property_read_u32(node, "qcom,fg-soc-min", &chip->soc_min);
 	if (rc < 0)
 		chip->soc_min = -EINVAL;
@@ -4902,11 +5761,22 @@ static int smb1360_probe(struct i2c_client *client,
 		return -ENOMEM;
 	}
 
+#ifdef CONFIG_ZX55Q05_ONLY
+	chip->last_temp = 0xFFFF;
+#endif
 	chip->resume_completed = true;
 	chip->client = client;
 	chip->dev = &client->dev;
 	chip->usb_psy = usb_psy;
 	chip->fake_battery_soc = -EINVAL;
+#ifdef CONFIG_ZX55Q05_ONLY
+	chip->use_voltage = false;
+	chip->hipad_is_full = false;
+	chip->term_count = 0;
+
+	chip->charger_overvoltage = false;
+#endif
+
 	mutex_init(&chip->read_write_lock);
 	mutex_init(&chip->parallel_chg_lock);
 	mutex_init(&chip->otp_gain_lock);
@@ -4915,7 +5785,6 @@ static int smb1360_probe(struct i2c_client *client,
 	INIT_DELAYED_WORK(&chip->delayed_init_work,
 			smb1360_delayed_init_work_fn);
 	init_completion(&chip->fg_mem_access_granted);
-	//smb1360_wakeup_src_init(chip);
 
 	/* probe the device to check if its actually connected */
 	rc = smb1360_read(chip, CFG_BATT_CHG_REG, &reg);
@@ -4923,7 +5792,18 @@ static int smb1360_probe(struct i2c_client *client,
 		pr_err("Failed to detect SMB1360, device may be absent\n");
 		return -ENODEV;
 	}
-
+#ifdef CONFIG_ZX55Q05_ONLY
+	rc = smb1360_read(chip, SOC_MAX_REG, &reg);
+	if (rc) {
+		pr_err("Failed to read capacity, device may be absent\n");
+	}
+	chip->capcity_reference = reg*100/255;
+	if((chip->capcity_reference > 100) || (chip->capcity_reference < 0))
+ 	{
+ 		chip->capcity_reference  = 85;
+ 	}
+#endif
+ 
 	rc = read_revision(chip, &chip->revision);
 	if (rc)
 		dev_err(chip->dev, "Couldn't read revision rc = %d\n", rc);
@@ -4935,13 +5815,23 @@ static int smb1360_probe(struct i2c_client *client,
 	}
 
         smb1360_wakeup_src_init(chip);
+#ifdef CONFIG_ZX55Q05_ONLY
+	INIT_DELAYED_WORK(&chip->adjust_charging_soc_work,hipad_adjust_charging_soc_work);
+	wake_lock_init(&hipad_chg_wake_lock, WAKE_LOCK_SUSPEND, "hipad-charger"); 
+#endif
 	device_init_wakeup(chip->dev, 1);
 	i2c_set_clientdata(client, chip);
 	mutex_init(&chip->irq_complete);
 	mutex_init(&chip->charging_disable_lock);
 	mutex_init(&chip->current_change_lock);
 	chip->default_i2c_addr = client->addr;
+#ifdef CONFIG_ZX55Q05_ONLY
+	atomic_set(&chip->hipad_lock_enable, 0);
+#endif
 	INIT_WORK(&chip->parallel_work, smb1360_parallel_work);
+#ifdef CONFIG_ZX55Q05_ONLY
+	INIT_DELAYED_WORK(&chip->temp_work, smb1360_temp_work);
+#endif
 	if (chip->cold_hysteresis || chip->hot_hysteresis)
 		INIT_WORK(&chip->jeita_hysteresis_work,
 				smb1360_jeita_hysteresis_work);
@@ -5116,6 +6006,9 @@ static int smb1360_probe(struct i2c_client *client,
 				rc);
 	}
 
+#ifdef CONFIG_ZX55Q05_ONLY
+	schedule_delayed_work(&chip->temp_work, 60*HZ);
+#endif
 	dev_info(chip->dev, "SMB1360 revision=0x%x probe success! batt=%d usb=%d soc=%d\n",
 			chip->revision,
 			smb1360_get_prop_batt_present(chip),
@@ -5136,6 +6029,11 @@ static int smb1360_remove(struct i2c_client *client)
 	struct smb1360_chip *chip = i2c_get_clientdata(client);
 	regulator_unregister(chip->otg_vreg.rdev);
 	power_supply_unregister(&chip->batt_psy);
+
+#ifdef CONFIG_ZX55Q05_ONLY
+	cancel_delayed_work_sync(&chip->adjust_charging_soc_work);
+	wake_lock_destroy(&hipad_chg_wake_lock);
+#endif
 	mutex_destroy(&chip->charging_disable_lock);
 	mutex_destroy(&chip->current_change_lock);
 	mutex_destroy(&chip->read_write_lock);
@@ -5184,7 +6082,6 @@ static int smb1360_suspend(struct device *dev)
 	mutex_lock(&chip->irq_complete);
 	chip->resume_completed = false;
 	mutex_unlock(&chip->irq_complete);
-
 	return 0;
 }
 
@@ -5234,7 +6131,28 @@ static void smb1360_shutdown(struct i2c_client *client)
 {
 	int rc;
 	struct smb1360_chip *chip = i2c_get_clientdata(client);
-
+#ifdef CONFIG_ZX55Q05_ONLY
+	u8 reg = 0;
+	if(chip->use_voltage )
+	{
+		/*if soc is 85%,then we set soc as 84%.So we can know that if we use voltage for caculating  soc .  */
+		if((chip->hipad_capacity == 85) || (chip->hipad_capacity == 100) ||(chip->hipad_capacity == 99) )
+		{
+			chip->hipad_capacity --;
+		}
+		 if(is_between(chip->hipad_capacity, 0, 100))
+		{
+			reg = DIV_ROUND_UP(chip->hipad_capacity * MAX_8_BITS,
+								100);
+			pr_log("soc=%d reg=%x\n",chip->hipad_capacity, reg);
+			rc = smb1360_write(chip, SOC_MAX_REG, reg);
+			if (rc) {
+				dev_err(chip->dev, "Couldn't write to SOC_MAX_REG rc=%d\n",
+						rc);
+			}
+		}
+	}
+#endif
 	rc = smb1360_otg_disable(chip);
 	if (rc)
 		pr_err("Couldn't disable OTG mode rc=%d\n", rc);

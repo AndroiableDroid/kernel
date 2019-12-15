@@ -58,7 +58,9 @@
 #define IS_CAL_DATA_PRESENT     0
 #define WAIT_FOR_CBC_IND	2
 
+#if defined(CONFIG_TEST_ONLY) || defined(CONFIG_TESTPLUS_ONLY)
 const char *chip_name = NULL;
+#endif
 
 /* module params */
 #define WCNSS_CONFIG_UNSPECIFIED (-1)
@@ -541,6 +543,7 @@ static ssize_t wcnss_version_show(struct device *dev,
 static DEVICE_ATTR(wcnss_version, S_IRUSR,
 		wcnss_version_show, NULL);
 
+#if defined(CONFIG_TEST_ONLY) || defined(CONFIG_TESTPLUS_ONLY)
 static ssize_t wcnss_name_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
@@ -551,7 +554,8 @@ static ssize_t wcnss_name_show(struct device *dev,
 
 static DEVICE_ATTR(wcnss_name, S_IRUSR,
 		wcnss_name_show, NULL);
-        
+#endif
+
 void wcnss_riva_dump_pmic_regs(void)
 {
 	int i, rc;
@@ -1172,10 +1176,12 @@ static int wcnss_create_sysfs(struct device *dev)
 	if (ret)
 		goto remove_thermal;
 
+#if defined(CONFIG_TEST_ONLY) || defined(CONFIG_TESTPLUS_ONLY)
 	ret = device_create_file(dev, &dev_attr_wcnss_name);
 	if (ret)
 		goto remove_thermal;
-    
+#endif
+
 	ret = device_create_file(dev, &dev_attr_wcnss_mac_addr);
 	if (ret)
 		goto remove_version;
@@ -3071,6 +3077,7 @@ wcnss_trigger_config(struct platform_device *pdev)
 		"qcom,wlan-indication-enabled"))
 		wcnss_en_wlan_led_trigger();
 
+#if defined(CONFIG_TEST_ONLY) || defined(CONFIG_TESTPLUS_ONLY)
    chip_name = kmalloc(PAGE_SIZE, GFP_KERNEL);
    if (!chip_name)
      printk("[%s]:Failed to alloc chip_name.\n", __func__);
@@ -3079,6 +3086,7 @@ wcnss_trigger_config(struct platform_device *pdev)
      printk("Error reading qcom,chip_name rc=%d\n", rc);
      chip_name = NULL;
    }
+#endif
 	return 0;
 
 fail_ioremap2:
